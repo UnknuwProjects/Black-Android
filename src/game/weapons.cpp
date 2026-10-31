@@ -73,8 +73,10 @@ constexpr bool kTrack = true;   // true: what each pickup (suppressor, medkit...
 constexpr uint32_t kPickupManager = 0x2D0D64;  // the pickup manager (or a pointer to it)
 constexpr uint32_t kPickupTable = 0x5844;      // its pickups, 0x160 bytes each: +0x140 kind, +0x148 type, +0x154 collected
 constexpr uint32_t kPickupSize = 0x160;
-constexpr uint32_t kStaticAt = 0x2D0000;   // game globals around the managers (track: ownership flags may live here)
-constexpr uint32_t kStaticBytes = 0x2000;
+constexpr uint32_t kStaticAt = 0x2C0000;   // game globals around the managers (track: ownership flags may live here)
+constexpr uint32_t kStaticBytes = 0x20000;
+constexpr uint32_t kFollowAt = 0x2D0000;   // only the pointers in this part are followed to their heap objects
+constexpr uint32_t kFollowBytes = 0x2000;
 constexpr int kPickupMax = 96;
 constexpr int kAmmoTypes = 10;
 constexpr uint32_t kPlayerMedkits = 0x8E1;  // byte in the player: the medkits held (found by the pickup tracker), the game holds 3
@@ -713,7 +715,7 @@ void WatchGather(const Level& l, std::vector<uint32_t>& addr) {
     range(PickupManager(), 0x800);
     range(kStaticAt, kStaticBytes);
     g_static_ptrs.clear();
-    for (uint32_t a = kStaticAt; a < kStaticAt + kStaticBytes; a += 4) {
+    for (uint32_t a = kFollowAt; a < kFollowAt + kFollowBytes; a += 4) {
         uint32_t v = R32(a);
         if (v >= 0x81000000 && v < 0x83F00000 && !(v & 3) && g_static_ptrs.size() < 160) {
             g_static_ptrs.push_back({v, a});
