@@ -817,6 +817,71 @@ void WeaponDump(const Level& l) {
                 unsigned(R32(w + o + 24)), unsigned(R32(w + o + 28)));
 }
 
+// ---- temporary: the whole heap around a suppressor pickup ------------------------------------------------------------
+// The watched regions showed no "suppressor owned" word, so it lives elsewhere. At the pickup message the heap is copied;
+// a second later the small words (and new heap pointers) that differ are kept, and two seconds later only those that still
+// hold the new value are logged: a word that goes on changing is a timer, not the item.
+constexpr bool kHeapDiff = true;
+constexpr uint32_t kHeapLo = 0x81000000, kHeapHi = 0x84000000;
+struct HeapDiff {
+    struct Cand {
+        uint32_t addr, before, after;
+    };
+    std::vector<uint32_t> snap;
+    std::vector<Cand> cand;
+    double event = -1;
+    int stage = 0;  // 0 idle, 1 copied, waits a second, 2 candidates, waits another second
+    uint32_t type = 0;
+};
+HeapDiff g_heap;
+
+void HeapDiffStart(uint32_t type) {
+    HeapDiff& h = g_heap;
+    if (!kHeapDiff || h.stage != 0) return;
+    h.snap.resize((kHeapHi - kHeapLo) / 4);
+    for (uint32_t i = 0; i < h.snap.size(); i++) h.snap[i] = R32(kHeapLo + i * 4);
+    h.cand.clear();
+    h.event = Seconds();
+    h.type = type;
+    h.stage = 1;
+    DiagLog("t=%.1f HEAP copied (%u words)", h.event, unsigned(h.snap.size()));
+}
+
+void HeapDiffTick(const Level& l) {
+    HeapDiff& h = g_heap;
+    if (h.stage == 0) return;
+    double t = Seconds();
+    if (h.stage == 1 && t - h.event >= 1.0) {
+        for (uint32_t i = 0; i < h.snap.size(); i++) {
+            uint32_t a = kHeapLo + i * 4, v = R32(a), b = h.snap[i];
+            if (v == b) continue;
+            bool small = b < 0x10000 && v < 0x10000;
+            bool fresh = b == 0 && v >= kHeapLo && v < kHeapHi && !(v & 3);
+            if ((small || fresh) && h.cand.size() < 300000) h.cand.push_back({a, b, v});
+        }
+        std::vector<uint32_t>().swap(h.snap);
+        h.stage = 2;
+        DiagLog("t=%.1f HEAP %u candidates after one second", t, unsigned(h.cand.size()));
+    } else if (h.stage == 2 && t - h.event >= 2.0) {
+        int small_shown = 0, fresh_shown = 0, kept = 0;
+        for (int pass = 0; pass < 2; pass++)
+            for (const auto& c : h.cand) {
+                if (R32(c.addr) != c.after) continue;
+                bool small = c.before < 0x10000 && c.after < 0x10000;
+                if (small != (pass == 0)) continue;
+                if (pass == 0) kept++;
+                int& shown = small ? small_shown : fresh_shown;
+                if (shown >= (small ? 300 : 100)) continue;
+                shown++;
+                DiagLog("t=%.1f HEAP %s %08X (%s): %08X -> %08X", t, small ? "small" : "ptr", unsigned(c.addr),
+                        WatchName(l, c.addr).c_str(), unsigned(c.before), unsigned(c.after));
+            }
+        DiagLog("t=%.1f HEAP end: %d small words stayed changed", t, kept);
+        h.cand.clear();
+        h.stage = 0;
+    }
+}
+
 void PickupWatch() {
     static bool dumped = false;
     static uint32_t last_med = 0xFFFFFFFF, last_cnt = 0xFFFFFFFF;
@@ -829,6 +894,7 @@ void PickupWatch() {
         return;
     }
     WeaponDump(l);
+    HeapDiffTick(l);
     if (uint32_t med = R32(l.inventory + 4); med != last_med) {  // medkit candidate: logged on every change (use too)
         if (last_med != 0xFFFFFFFF) DiagLog("t=%.1f MEDKIT? inventory+4: %08X -> %08X", Seconds(), unsigned(last_med), unsigned(med));
         last_med = med;
@@ -895,6 +961,7 @@ void PickupEvent(uint32_t category, uint32_t type, uint32_t ret) {
     if (!kTrack || category > 4 || !ReadLevel(l)) return;  // kind 0 too: the medkit may be it
     if (category == 0 && ret != 0x001BEDF8) return;  // kind 0 from another caller comes by the hundred (healing)
     DiagLog("t=%.1f pickup message: kind %u, type %u, caller %08X", Seconds(), category, type, unsigned(ret));
+    if (category == 4) HeapDiffStart(type);
     Watch& w = g_watch;
     if (w.event >= 0 || w.addr.empty() || w.hist.empty()) return;
     w.event = Seconds();
