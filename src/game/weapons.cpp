@@ -818,9 +818,10 @@ void WeaponDump(const Level& l) {
 }
 
 // ---- temporary: the whole heap around a suppressor pickup ------------------------------------------------------------
-// The watched regions showed no "suppressor owned" word, so it lives elsewhere. At the pickup message the heap is copied;
-// a second later the small words (and new heap pointers) that differ are kept, and two seconds later only those that still
-// hold the new value are logged: a word that goes on changing is a timer, not the item.
+// The watched regions showed no "suppressor owned" word, so it lives elsewhere. While a level plays the heap is copied every
+// two seconds (the words that changed since the last copy are marked as noisy). The pickup message starts the diff against
+// the last copy, which is older than the pickup's own writes: a second later the small words (and new heap pointers) that
+// differ and were quiet before are kept, and another second later only those still holding the new value are logged.
 constexpr bool kHeapDiff = true;
 constexpr uint32_t kHeapLo = 0x81000000, kHeapHi = 0x84000000;
 struct HeapDiff {
@@ -828,38 +829,58 @@ struct HeapDiff {
         uint32_t addr, before, after;
     };
     std::vector<uint32_t> snap;
+    std::vector<uint64_t> noisy;  // one bit a word: changed between the last two copies
     std::vector<Cand> cand;
-    double event = -1;
-    int stage = 0;  // 0 idle, 1 copied, waits a second, 2 candidates, waits another second
-    uint32_t type = 0;
+    double event = -1, last = -100;
+    bool have = false;
+    int stage = 0;  // 0 copying every two seconds, 1 waits a second, 2 candidates, waits another second
 };
 HeapDiff g_heap;
 
-void HeapDiffStart(uint32_t type) {
+void HeapDiffReset() {
+    g_heap.have = false;
+    g_heap.stage = 0;
+    g_heap.cand.clear();
+}
+
+void HeapDiffRefresh(double t) {
     HeapDiff& h = g_heap;
-    if (!kHeapDiff || h.stage != 0) return;
-    h.snap.resize((kHeapHi - kHeapLo) / 4);
-    for (uint32_t i = 0; i < h.snap.size(); i++) h.snap[i] = R32(kHeapLo + i * 4);
-    h.cand.clear();
+    size_t n = (kHeapHi - kHeapLo) / 4;
+    if (h.snap.size() != n) h.snap.assign(n, 0);
+    h.noisy.assign((n + 63) / 64, 0);
+    for (size_t i = 0; i < n; i++) {
+        uint32_t v = R32(kHeapLo + uint32_t(i) * 4);
+        if (h.have && v != h.snap[i]) h.noisy[i >> 6] |= 1ull << (i & 63);
+        h.snap[i] = v;
+    }
+    h.have = true;
+    h.last = t;
+}
+
+void HeapDiffStart() {
+    HeapDiff& h = g_heap;
+    if (!kHeapDiff || h.stage != 0 || !h.have) return;
     h.event = Seconds();
-    h.type = type;
     h.stage = 1;
-    DiagLog("t=%.1f HEAP copied (%u words)", h.event, unsigned(h.snap.size()));
+    DiagLog("t=%.1f HEAP diff starts, baseline %.1f s old", h.event, h.event - h.last);
 }
 
 void HeapDiffTick(const Level& l) {
     HeapDiff& h = g_heap;
-    if (h.stage == 0) return;
+    if (!kHeapDiff) return;
     double t = Seconds();
-    if (h.stage == 1 && t - h.event >= 1.0) {
-        for (uint32_t i = 0; i < h.snap.size(); i++) {
-            uint32_t a = kHeapLo + i * 4, v = R32(a), b = h.snap[i];
-            if (v == b) continue;
-            bool small = b < 0x10000 && v < 0x10000;
+    if (h.stage == 0) {
+        if (t - h.last >= 2.0) HeapDiffRefresh(t);
+    } else if (h.stage == 1 && t - h.event >= 1.0) {
+        h.cand.clear();
+        auto cluster = [](uint32_t v) { return v == 0 || v == 0x3FF || v == 0x401; };  // a block of effects flips these
+        for (size_t i = 0; i < h.snap.size(); i++) {
+            uint32_t a = kHeapLo + uint32_t(i) * 4, v = R32(a), b = h.snap[i];
+            if (v == b || (h.noisy[i >> 6] >> (i & 63) & 1)) continue;
+            bool small = b < 0x10000 && v < 0x10000 && !(cluster(b) && cluster(v));
             bool fresh = b == 0 && v >= kHeapLo && v < kHeapHi && !(v & 3);
             if ((small || fresh) && h.cand.size() < 300000) h.cand.push_back({a, b, v});
         }
-        std::vector<uint32_t>().swap(h.snap);
         h.stage = 2;
         DiagLog("t=%.1f HEAP %u candidates after one second", t, unsigned(h.cand.size()));
     } else if (h.stage == 2 && t - h.event >= 2.0) {
@@ -871,14 +892,16 @@ void HeapDiffTick(const Level& l) {
                 if (small != (pass == 0)) continue;
                 if (pass == 0) kept++;
                 int& shown = small ? small_shown : fresh_shown;
-                if (shown >= (small ? 300 : 100)) continue;
+                if (shown >= (small ? 400 : 60)) continue;
                 shown++;
                 DiagLog("t=%.1f HEAP %s %08X (%s): %08X -> %08X", t, small ? "small" : "ptr", unsigned(c.addr),
                         WatchName(l, c.addr).c_str(), unsigned(c.before), unsigned(c.after));
             }
         DiagLog("t=%.1f HEAP end: %d small words stayed changed", t, kept);
         h.cand.clear();
+        h.have = false;  // the copy is stale now: the next one is a fresh baseline
         h.stage = 0;
+        h.last = t;
     }
 }
 
@@ -891,6 +914,7 @@ void PickupWatch() {
         w = Watch();
         dumped = false;
         last_med = last_cnt = 0xFFFFFFFF;
+        HeapDiffReset();
         return;
     }
     WeaponDump(l);
@@ -961,7 +985,7 @@ void PickupEvent(uint32_t category, uint32_t type, uint32_t ret) {
     if (!kTrack || category > 4 || !ReadLevel(l)) return;  // kind 0 too: the medkit may be it
     if (category == 0 && ret != 0x001BEDF8) return;  // kind 0 from another caller comes by the hundred (healing)
     DiagLog("t=%.1f pickup message: kind %u, type %u, caller %08X", Seconds(), category, type, unsigned(ret));
-    if (category == 4) HeapDiffStart(type);
+    if (category == 4) HeapDiffStart();
     Watch& w = g_watch;
     if (w.event >= 0 || w.addr.empty() || w.hist.empty()) return;
     w.event = Seconds();
