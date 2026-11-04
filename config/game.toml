@@ -330,6 +330,14 @@ at = 0x1E644A
 call = "SwayEnd"
 
 [[hook]]
+at = 0x1E6757
+call = "ViewmodelShift"
+ 
+[[hook]]
+at = 0x163655
+call = "ShellShift"
+
+[[hook]]
 at = 0x1F11CD
 call = "PhysicsTime"
 
